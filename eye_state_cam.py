@@ -70,6 +70,7 @@ RIGHT_EYE_IDX = [362, 385, 387, 263, 373, 380]
 _FONT_PATH: Optional[str] = None
 _PIL_FONT: Optional["ImageFont.FreeTypeFont"] = None
 _FREETYPE = None
+SHOW_HELMET_BOX = False
 
 
 def _dist(a: Tuple[int, int], b: Tuple[int, int]) -> float:
@@ -208,6 +209,39 @@ def _eye_center(pts: np.ndarray, idxs: list[int]) -> Tuple[int, int]:
     return int(xs.mean()), int(ys.mean())
 
 
+def _face_bbox(pts: np.ndarray) -> Tuple[int, int, int, int]:
+    x1 = int(pts[:, 0].min())
+    y1 = int(pts[:, 1].min())
+    x2 = int(pts[:, 0].max())
+    y2 = int(pts[:, 1].max())
+    return x1, y1, x2, y2
+
+
+def _select_primary_face(face_pts_list: list[np.ndarray], width: int, height: int) -> int:
+    frame_cx = width * 0.5
+    frame_cy = height * 0.5
+    frame_area = float(width * height)
+    frame_diag = max(float(np.hypot(width, height)), 1.0)
+
+    best_idx = 0
+    best_score = -1e18
+    for idx, pts in enumerate(face_pts_list):
+        x1, y1, x2, y2 = _face_bbox(pts)
+        face_w = max(1.0, float(x2 - x1))
+        face_h = max(1.0, float(y2 - y1))
+        area = face_w * face_h
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        dist_norm = float(np.hypot(cx - frame_cx, cy - frame_cy)) / frame_diag
+
+        # Prefer larger and more centered face.
+        score = area - dist_norm * (0.35 * frame_area)
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+    return best_idx
+
+
 def _hands_to_xy(hand_landmarks, w: int, h: int) -> list[Tuple[int, int]]:
     points = []
     for hand in hand_landmarks:
@@ -240,17 +274,139 @@ def _is_eye_covered(
     return False
 
 
+def _clamp_box(
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    width: int,
+    height: int,
+) -> Optional[Tuple[int, int, int, int]]:
+    x1 = max(0, min(x1, width - 1))
+    y1 = max(0, min(y1, height - 1))
+    x2 = max(0, min(x2, width))
+    y2 = max(0, min(y2, height))
+    if x2 - x1 < 10 or y2 - y1 < 10:
+        return None
+    return x1, y1, x2, y2
+
+
+def _build_helmet_roi(pts: np.ndarray, width: int, height: int) -> Optional[Tuple[int, int, int, int]]:
+    x_min = int(pts[:, 0].min())
+    x_max = int(pts[:, 0].max())
+    y_min = int(pts[:, 1].min())
+    y_max = int(pts[:, 1].max())
+    face_w = x_max - x_min
+    face_h = y_max - y_min
+    if face_w < 40 or face_h < 40:
+        return None
+
+    # Focus on central area above forehead where helmet shell is expected.
+    rx1 = int(x_min + face_w * 0.20)
+    rx2 = int(x_max - face_w * 0.20)
+    ry1 = int(y_min - face_h * 0.62)
+    ry2 = int(y_min + face_h * 0.08)
+    return _clamp_box(rx1, ry1, rx2, ry2, width, height)
+
+
+def _helmet_mask_from_hsv(hsv: np.ndarray) -> np.ndarray:
+    # Common hard-hat colors: yellow/orange/red/blue/white.
+    yellow = cv2.inRange(hsv, (18, 80, 70), (40, 255, 255))
+    orange = cv2.inRange(hsv, (5, 90, 70), (17, 255, 255))
+    red1 = cv2.inRange(hsv, (0, 90, 70), (10, 255, 255))
+    red2 = cv2.inRange(hsv, (170, 90, 70), (180, 255, 255))
+    blue = cv2.inRange(hsv, (90, 70, 60), (130, 255, 255))
+    white = cv2.inRange(hsv, (0, 0, 185), (180, 65, 255))
+    mask = yellow | orange | red1 | red2 | blue | white
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    return mask
+
+
+def _skin_mask(roi_bgr: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    ycrcb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2YCrCb)
+    skin_hsv = cv2.inRange(hsv, (0, 20, 50), (25, 220, 255))
+    skin_ycrcb = cv2.inRange(ycrcb, (0, 135, 85), (255, 180, 135))
+    skin = cv2.bitwise_and(skin_hsv, skin_ycrcb)
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    skin = cv2.morphologyEx(skin, cv2.MORPH_OPEN, kernel, iterations=1)
+    skin = cv2.morphologyEx(skin, cv2.MORPH_CLOSE, kernel, iterations=1)
+    return skin
+
+
+def _detect_helmet(frame: np.ndarray, pts: np.ndarray) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
+    h, w = frame.shape[:2]
+    roi_box = _build_helmet_roi(pts, w, h)
+    if roi_box is None:
+        return False, 0.0, None
+
+    x1, y1, x2, y2 = roi_box
+    roi = frame[y1:y2, x1:x2]
+    if roi.size == 0:
+        return False, 0.0, roi_box
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    mask = _helmet_mask_from_hsv(hsv)
+    skin = _skin_mask(roi)
+    mask = cv2.bitwise_and(mask, cv2.bitwise_not(skin))
+
+    total = float(mask.shape[0] * mask.shape[1])
+    color_ratio = float(np.count_nonzero(mask)) / total
+    top_rows = max(1, int(mask.shape[0] * 0.55))
+    top_ratio = float(np.count_nonzero(mask[:top_rows, :])) / float(top_rows * mask.shape[1])
+    bottom_rows = max(1, int(mask.shape[0] * 0.35))
+    bottom_ratio = float(np.count_nonzero(mask[-bottom_rows:, :])) / float(bottom_rows * mask.shape[1])
+
+    center_x1 = int(mask.shape[1] * 0.20)
+    center_x2 = int(mask.shape[1] * 0.80)
+    center_y2 = int(mask.shape[0] * 0.75)
+    center = mask[:center_y2, center_x1:center_x2]
+    center_ratio = float(np.count_nonzero(center)) / float(center.size) if center.size else 0.0
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    max_area_ratio = 0.0
+    max_width_ratio = 0.0
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        max_area = cv2.contourArea(largest)
+        max_area_ratio = float(max_area) / total
+        _, _, cw, _ = cv2.boundingRect(largest)
+        max_width_ratio = float(cw) / float(mask.shape[1])
+
+    # Aggregate score from color coverage and connected region size.
+    score = (
+        0.28 * color_ratio
+        + 0.24 * top_ratio
+        + 0.18 * bottom_ratio
+        + 0.20 * center_ratio
+        + 0.20 * max_area_ratio
+    )
+    helmet_found = (
+        color_ratio >= 0.08
+        and top_ratio >= 0.10
+        and center_ratio >= 0.09
+        and max_area_ratio >= 0.04
+        and max_width_ratio >= 0.38
+        and score >= 0.12
+    )
+    return helmet_found, score, roi_box
+
+
 def run() -> int:
+    window_name = "Eye State"
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Error: Camera not found or cannot be opened.")
         return 1
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
     mp_face_mesh = _get_face_mesh_module()
     mp_hands = _get_hands_module()
     face_mesh = mp_face_mesh.FaceMesh(
         static_image_mode=False,
-        max_num_faces=1,
+        max_num_faces=3,
         refine_landmarks=True,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
@@ -267,6 +423,7 @@ def run() -> int:
     calib_start = time.time()
     calib_samples = []
     threshold: Optional[float] = None
+    helmet_score_smooth = 0.0
 
     status = "НЕТ ЛИЦА"
 
@@ -283,7 +440,9 @@ def run() -> int:
 
         results = face_mesh.process(rgb)
         hands_results = hands.process(rgb)
-        face_found = results.multi_face_landmarks is not None
+        multi_faces = results.multi_face_landmarks or []
+        face_count = len(multi_faces)
+        face_found = face_count > 0
         hand_points = []
         if hands_results.multi_hand_landmarks:
             hand_points = _hands_to_xy(hands_results.multi_hand_landmarks, w, h)
@@ -291,10 +450,28 @@ def run() -> int:
         ear_value: Optional[float] = None
         left_status = "НЕТ ЛИЦА"
         right_status = "НЕТ ЛИЦА"
+        helmet_status = "НЕТ ЛИЦА"
+        helmet_score = 0.0
+        helmet_box: Optional[Tuple[int, int, int, int]] = None
+        extra_person = False
 
         if face_found:
-            landmarks = results.multi_face_landmarks[0].landmark
-            pts = _landmarks_to_xy(landmarks, w, h)
+            face_pts_list = [
+                _landmarks_to_xy(face_landmarks.landmark, w, h)
+                for face_landmarks in multi_faces
+            ]
+            primary_idx = _select_primary_face(face_pts_list, w, h)
+            pts = face_pts_list[primary_idx]
+            extra_person = face_count > 1
+
+            helmet_found, helmet_score, helmet_box = _detect_helmet(frame, pts)
+            helmet_score_smooth = 0.72 * helmet_score_smooth + 0.28 * helmet_score
+            helmet_confirmed = helmet_found or helmet_score_smooth >= 0.34
+            helmet_status = "НАДЕТА" if helmet_confirmed else "НЕ ОБНАРУЖЕНА"
+            if SHOW_HELMET_BOX and helmet_box is not None:
+                x1, y1, x2, y2 = helmet_box
+                box_color = (0, 200, 0) if helmet_confirmed else (0, 0, 255)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
 
             left_ear = _ear(pts, LEFT_EYE_IDX)
             right_ear = _ear(pts, RIGHT_EYE_IDX)
@@ -359,15 +536,35 @@ def run() -> int:
         if face_found:
             _queue_text(texts, f"Левый: {left_status}", 75 if calib_active else 50, (0, 255, 255))
             _queue_text(texts, f"Правый: {right_status}", 100 if calib_active else 75, (0, 255, 255))
+            _queue_text(
+                texts,
+                f"Каска: {helmet_status} ({helmet_score_smooth:.2f})",
+                125 if calib_active else 100,
+                (0, 255, 255),
+            )
+            if extra_person:
+                _queue_text(
+                    texts,
+                    "Второй человек: ОБНАРУЖЕН",
+                    150 if calib_active else 125,
+                    (0, 180, 255),
+                )
         else:
             _queue_text(texts, f"Статус: {status}", 75 if calib_active else 50, (0, 255, 255))
 
         _draw_texts(frame, texts)
+        cv2.imshow(window_name, frame)
 
-        cv2.imshow("Eye State", frame)
+        # Allow close by window X button.
+        try:
+            if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                break
+        except cv2.error:
+            break
 
         key = cv2.waitKey(1) & 0xFF
-        if key in (ord("q"), ord("Q")):
+        # Q/q, Russian Й/й (common layout switch), and Esc.
+        if key in (ord("q"), ord("Q"), 201, 233, 27):
             break
         if key in (ord("r"), ord("R")):
             calib_active = True
