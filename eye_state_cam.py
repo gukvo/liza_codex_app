@@ -1,10 +1,16 @@
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from typing import Optional, Tuple
 
 import cv2
 import numpy as np
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("GLOG_minloglevel", "2")
+os.environ.setdefault("ABSL_LOG_LEVEL", "3")
 
 try:
     import mediapipe as mp
@@ -63,6 +69,12 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
+try:
+    from yolo_detector import NorfairObjectTracker, YoloObjectDetector
+except Exception:
+    NorfairObjectTracker = None
+    YoloObjectDetector = None
+
 
 LEFT_EYE_IDX = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE_IDX = [362, 385, 387, 263, 373, 380]
@@ -75,6 +87,24 @@ SHOW_HELMET_BOX = False
 
 def _dist(a: Tuple[int, int], b: Tuple[int, int]) -> float:
     return float(np.hypot(a[0] - b[0], a[1] - b[1]))
+
+
+@contextmanager
+def _suppress_stderr_fd():
+    try:
+        fd = sys.stderr.fileno()
+    except Exception:
+        yield
+        return
+
+    saved_fd = os.dup(fd)
+    try:
+        with open(os.devnull, "w", encoding="utf-8") as devnull:
+            os.dup2(devnull.fileno(), fd)
+            yield
+    finally:
+        os.dup2(saved_fd, fd)
+        os.close(saved_fd)
 
 
 def _ear(pts: np.ndarray, idxs: list[int]) -> float:
@@ -404,19 +434,69 @@ def run() -> int:
 
     mp_face_mesh = _get_face_mesh_module()
     mp_hands = _get_hands_module()
-    face_mesh = mp_face_mesh.FaceMesh(
-        static_image_mode=False,
-        max_num_faces=3,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
-    hands = mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=2,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
+    with _suppress_stderr_fd():
+        face_mesh = mp_face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=3,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        hands = mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+    yolo_detector = None
+    yolo_tracker = None
+    yolo_enabled = False
+    yolo_tracker_enabled = True
+    yolo_backend = ""
+    yolo_tracker_name = ""
+    yolo_error = ""
+    yolo_error_short = ""
+    yolo_detections = []
+    yolo_prev_boxes_by_class = {}
+    yolo_last_update_frame = 0
+    yolo_hold_frames = 6
+    yolo_executor = None
+    yolo_future = None
+    yolo_frame_idx = 0
+    yolo_empty_results = 0
+    if YoloObjectDetector is not None:
+        try:
+            yolo_detector = YoloObjectDetector(
+                conf_threshold=0.22,
+                iou_threshold=0.50,
+                input_size=640,
+            )
+            if NorfairObjectTracker is not None:
+                try:
+                    yolo_tracker = NorfairObjectTracker(
+                        distance_threshold=0.70,
+                        hit_counter_max=16,
+                        smoothing=0.60,
+                        max_missing_updates=6,
+                        match_iou_threshold=0.12,
+                        fast_smoothing=0.88,
+                        fast_motion_ratio=0.30,
+                    )
+                    yolo_tracker_name = "NORFAIR"
+                except Exception:
+                    yolo_tracker = None
+                    yolo_tracker_name = ""
+            yolo_executor = ThreadPoolExecutor(max_workers=1)
+            yolo_enabled = True
+            yolo_backend = getattr(yolo_detector, "backend", "").upper()
+            if yolo_backend == "DARKNET":
+                yolo_hold_frames = 8
+        except Exception as exc:
+            yolo_error = str(exc)
+            yolo_error_short = yolo_error.replace("\n", " ")[:90]
+    else:
+        yolo_error = "Модуль YOLO не загружен."
+        yolo_error_short = yolo_error
 
     calib_secs = 2.0
     calib_active = True
@@ -437,6 +517,73 @@ def run() -> int:
         frame = cv2.flip(frame, 1)
         h, w = frame.shape[:2]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        new_yolo_detections = None
+        if yolo_enabled and yolo_detector is not None:
+            yolo_backend = getattr(yolo_detector, "backend", "").upper()
+            yolo_frame_idx += 1
+            if yolo_future is not None and yolo_future.done():
+                try:
+                    new_yolo_detections = yolo_future.result()
+                    if new_yolo_detections:
+                        yolo_empty_results = 0
+                    else:
+                        yolo_empty_results += 1
+                        if (
+                            yolo_backend == "ORT"
+                            and yolo_empty_results >= 8
+                            and hasattr(yolo_detector, "force_onnx_backend")
+                            and yolo_detector.force_onnx_backend()
+                        ):
+                            yolo_backend = "ONNX"
+                            yolo_empty_results = 0
+                except Exception as exc:
+                    yolo_error = str(exc)
+                    yolo_error_short = yolo_error.replace("\n", " ")[:90]
+                    yolo_enabled = False
+                yolo_future = None
+
+            # Keep one async inference in flight all the time for minimal latency.
+            if yolo_executor is not None and yolo_future is None:
+                yolo_future = yolo_executor.submit(yolo_detector.detect, frame.copy())
+
+            # Update tracker every frame. On frames without fresh detections tracker predicts
+            # motion so the box follows faster and with less visual lag.
+            if yolo_tracker is not None:
+                if yolo_tracker_enabled:
+                    yolo_detections = yolo_tracker.update(new_yolo_detections, frame.shape)
+                    # If tracker produced no tracks on this update, fallback to raw detections.
+                    if new_yolo_detections is not None and not yolo_detections:
+                        yolo_detections = new_yolo_detections
+                elif new_yolo_detections is not None:
+                    if hasattr(yolo_detector, "_smooth_detections_temporal"):
+                        new_yolo_detections, yolo_prev_boxes_by_class = yolo_detector._smooth_detections_temporal(
+                            new_yolo_detections,
+                            yolo_prev_boxes_by_class,
+                            alpha=0.35,
+                        )
+                    yolo_detections = new_yolo_detections
+
+                if new_yolo_detections is not None:
+                    yolo_last_update_frame = yolo_frame_idx
+                elif (yolo_frame_idx - yolo_last_update_frame) > yolo_hold_frames:
+                    yolo_detections = []
+                    yolo_prev_boxes_by_class = {}
+            else:
+                if new_yolo_detections is not None:
+                    if hasattr(yolo_detector, "_smooth_detections_temporal"):
+                        new_yolo_detections, yolo_prev_boxes_by_class = yolo_detector._smooth_detections_temporal(
+                            new_yolo_detections,
+                            yolo_prev_boxes_by_class,
+                            alpha=0.35,
+                        )
+                    yolo_last_update_frame = yolo_frame_idx
+                    yolo_detections = new_yolo_detections
+                elif (yolo_frame_idx - yolo_last_update_frame) > yolo_hold_frames:
+                    yolo_detections = []
+                    yolo_prev_boxes_by_class = {}
+
+            yolo_detector.draw(frame, yolo_detections, max_boxes=12, show_track_id=False)
 
         results = face_mesh.process(rgb)
         hands_results = hands.process(rgb)
@@ -536,21 +683,57 @@ def run() -> int:
         if face_found:
             _queue_text(texts, f"Левый: {left_status}", 75 if calib_active else 50, (0, 255, 255))
             _queue_text(texts, f"Правый: {right_status}", 100 if calib_active else 75, (0, 255, 255))
+            y_text = 125 if calib_active else 100
             _queue_text(
                 texts,
                 f"Каска: {helmet_status} ({helmet_score_smooth:.2f})",
-                125 if calib_active else 100,
+                y_text,
                 (0, 255, 255),
             )
+            y_text += 25
             if extra_person:
                 _queue_text(
                     texts,
                     "Второй человек: ОБНАРУЖЕН",
-                    150 if calib_active else 125,
+                    y_text,
                     (0, 180, 255),
                 )
+                y_text += 25
+            if yolo_enabled:
+                yolo_parts = [p for p in (yolo_backend, yolo_tracker_name) if p]
+                if yolo_tracker is not None and not yolo_tracker_enabled:
+                    yolo_parts = [p for p in yolo_parts if p != "NORFAIR"]
+                backend_tag = f" ({'+'.join(yolo_parts)})" if yolo_parts else ""
+                _queue_text(
+                    texts,
+                    f"YOLO{backend_tag}: {len(yolo_detections)} объектов",
+                    y_text,
+                    (255, 220, 120),
+                )
+            elif yolo_error:
+                _queue_text(texts, "YOLO: ошибка инициализации", y_text, (0, 120, 255))
+                y_text += 25
+                if yolo_error_short:
+                    _queue_text(texts, f"Причина: {yolo_error_short}", y_text, (0, 120, 255))
         else:
             _queue_text(texts, f"Статус: {status}", 75 if calib_active else 50, (0, 255, 255))
+            y_text = 100 if calib_active else 75
+            if yolo_enabled:
+                yolo_parts = [p for p in (yolo_backend, yolo_tracker_name) if p]
+                if yolo_tracker is not None and not yolo_tracker_enabled:
+                    yolo_parts = [p for p in yolo_parts if p != "NORFAIR"]
+                backend_tag = f" ({'+'.join(yolo_parts)})" if yolo_parts else ""
+                _queue_text(
+                    texts,
+                    f"YOLO{backend_tag}: {len(yolo_detections)} объектов",
+                    y_text,
+                    (255, 220, 120),
+                )
+            elif yolo_error:
+                _queue_text(texts, "YOLO: ошибка инициализации", y_text, (0, 120, 255))
+                y_text += 25
+                if yolo_error_short:
+                    _queue_text(texts, f"Причина: {yolo_error_short}", y_text, (0, 120, 255))
 
         _draw_texts(frame, texts)
         cv2.imshow(window_name, frame)
@@ -566,6 +749,36 @@ def run() -> int:
         # Q/q, Russian Й/й (common layout switch), and Esc.
         if key in (ord("q"), ord("Q"), 201, 233, 27):
             break
+        if key in (ord("o"), ord("O")):
+            if yolo_detector is not None:
+                yolo_enabled = not yolo_enabled
+                if not yolo_enabled:
+                    yolo_detections = []
+                    yolo_future = None
+                    yolo_last_update_frame = 0
+                    yolo_empty_results = 0
+                    yolo_prev_boxes_by_class = {}
+                    if yolo_tracker is not None:
+                        yolo_tracker.reset()
+        # T/t toggles tracker on/off to quickly isolate detector issues.
+        if key in (ord("t"), ord("T"), 197, 229):
+            if yolo_tracker is not None:
+                yolo_tracker_enabled = not yolo_tracker_enabled
+                if yolo_tracker_enabled:
+                    yolo_tracker.reset()
+                yolo_detections = []
+                yolo_prev_boxes_by_class = {}
+        # B/b and Russian И/и (same physical key on RU layout).
+        if key in (ord("b"), ord("B"), 200, 232):
+            if (
+                yolo_detector is not None
+                and hasattr(yolo_detector, "force_onnx_backend")
+                and yolo_detector.force_onnx_backend()
+            ):
+                yolo_backend = "ONNX"
+                yolo_error = ""
+                yolo_error_short = ""
+                yolo_empty_results = 0
         if key in (ord("r"), ord("R")):
             calib_active = True
             calib_start = time.time()
@@ -576,6 +789,8 @@ def run() -> int:
     cv2.destroyAllWindows()
     face_mesh.close()
     hands.close()
+    if yolo_executor is not None:
+        yolo_executor.shutdown(wait=False, cancel_futures=True)
     return 0
 
 

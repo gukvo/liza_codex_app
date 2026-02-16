@@ -28,7 +28,9 @@ set "VENV_PY=%VENV%\Scripts\python.exe"
   "numpy==1.26.4" ^
   "opencv-python==4.8.1.78" ^
   "opencv-contrib-python==4.8.1.78" ^
-  "mediapipe==0.10.21"
+  "mediapipe==0.10.21" ^
+  "onnxruntime>=1.18,<2" ^
+  "norfair>=2.2,<3"
 
 echo Using Python %VER% from %VENV_PY%
 %VENV_PY% -c "import sys; print(sys.version)"
@@ -48,19 +50,18 @@ set "CHECK=%TEMP%\mp_face_mesh_check_%RANDOM%.py"
 >> "%CHECK%" echo         ok = True
 >> "%CHECK%" echo     except Exception as exc:
 >> "%CHECK%" echo         err = exc
->> "%CHECK%" echo if ok:
->> "%CHECK%" echo     print("FaceMesh OK")
->> "%CHECK%" echo else:
+>> "%CHECK%" echo if not ok:
 >> "%CHECK%" echo     print("FaceMesh import failed:", err)
 >> "%CHECK%" echo     traceback.print_exc()
 >> "%CHECK%" echo     raise SystemExit(1)
 
-%VENV_PY% "%CHECK%"
+%VENV_PY% "%CHECK%" >nul 2>nul
 set "CHECK_ERR=%errorlevel%"
 del /f /q "%CHECK%" >nul 2>&1
 if not "%CHECK_ERR%"=="0" (
   echo.
-  echo If you see DLL load errors above, install the Microsoft Visual C++ 2015-2022 Redistributable x64.
+  echo FaceMesh init check failed.
+  echo Install Microsoft Visual C++ 2015-2022 Redistributable x64, then retry.
   exit /b 3
 )
 
